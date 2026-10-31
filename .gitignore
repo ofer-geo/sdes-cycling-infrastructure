@@ -1,0 +1,27 @@
+# Environments
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Data is never committed, except the anonymised sample and the GIS layers (published with
+# attribution to the Tel Aviv-Yafo Municipality, see data/layers/README.md)
+data/*
+!data/sample/
+!data/layers/
+*.rar
+*.csv
+!data/sample/*.csv
+*.parquet
+*.gpkg
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.graphml
+
+# osmnx HTTP cache
+cache/

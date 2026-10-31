@@ -1,0 +1,226 @@
+"""Parking-events dataset built from MDS Status Changes (thesis 5.2.2, Appendices F-G).
+
+A *parking event* is the time a vehicle stood ready to ride at one spot, and how it ended.
+
+Core rule (replaces the record-by-record loops of the original code): consecutive
+"ready" records (``available`` / ``reserved``) of the same vehicle that are within
+``same_location_m`` of each other belong to one event. Reservations that end in a ride,
+cancelled reservations and repeated ``available`` reports therefore all fold into the
+event they interrupt. The event ends at the first non-ready record (its state is the end
+reason) or when the vehicle re-appears elsewhere (end reason ``unknown``).
+"""
+
+from __future__ import annotations
+
+import contextlib
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+
+from sdes.config import Config
+from sdes.geo import Layers, lonlat_transformer
+from sdes.report import FilterReport
+
+READY = ("available", "reserved")
+END_REASON = {"on_trip": "on_trip", "non_operational": "non_operational",
+              "removed": "removed", "unknown": "unknown", "elsewhere": "unknown"}
+
+
+class ParkingEventBuilder:
+    def __init__(self, cfg: Config, layers: Layers):
+        self.cfg = cfg
+        self.rules = cfg.parking
+        self.layers = layers
+        self.report = FilterReport("Parking events")
+
+    # ------------------------------------------------------------------ pipeline
+    def run(self, status: pd.DataFrame, seed: pd.DataFrame | None,
+            trip_starts: pd.DataFrame) -> gpd.GeoDataFrame:
+        records = self.prepare(status, seed)
+        events = self.build_events(records)
+        events = self.drop_relocated(events)
+        events = self.merge_interruptions(events)
+        events = self.add_spatial_attributes(events)
+        events = self.associate_trips(events, trip_starts)
+        return self.drop_artifacts(events)
+
+    # ------------------------------------------------------------------ stage 1
+    def prepare(self, status: pd.DataFrame, seed: pd.DataFrame | None) -> gpd.GeoDataFrame:
+        """Scooters only, de-duplicated, projected, sorted per vehicle.
+
+        ``seed`` (the previous month) gives every vehicle its state on day one, so a
+        scooter parked across midnight on the 1st still yields a full event.
+        """
+        frames = [status] if seed is None else [seed, status]
+        df = pd.concat(frames, ignore_index=True)
+        df = df[df["vehicle_type"] == self.cfg.study.vehicle_type]
+        df = df.drop_duplicates(["device_id", "event_time", "vehicle_state", "lat", "lon"])
+        df = df.sort_values(["device_id", "event_time"], kind="stable", ignore_index=True)
+        geom = gpd.points_from_xy(df["lon"], df["lat"], crs=self.cfg.crs.geographic)
+        return gpd.GeoDataFrame(df[["device_id", "vehicle_state", "event_types", "event_time"]],
+                                geometry=geom).to_crs(self.cfg.crs.projected)
+
+    # ------------------------------------------------------------------ stages 2-4
+    def build_events(self, rec: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        same_dev_prev = rec["device_id"].eq(rec["device_id"].shift()).fillna(False).astype(bool)
+        x, y = rec.geometry.x.to_numpy(), rec.geometry.y.to_numpy()
+        step = np.r_[np.inf, np.hypot(np.diff(x), np.diff(y))]
+        ready = rec["vehicle_state"].isin(READY).to_numpy()
+
+        continues = ready & np.r_[False, ready[:-1]] & same_dev_prev.to_numpy() & (
+            step <= self.rules.same_location_m)
+        starts = ready & ~continues
+        event_id = np.where(ready, np.cumsum(starts), 0)
+
+        # the record that ends each event is the one right after its last ready record
+        last_of_event = ready & ~np.r_[continues[1:], False]
+        enders = np.flatnonzero(last_of_event) + 1
+        device = rec["device_id"].to_numpy()
+        in_bounds = enders < len(rec)
+        clipped = np.minimum(enders, len(rec) - 1)
+        has_end = in_bounds & (device[clipped] == device[enders - 1])
+
+        first = rec.loc[starts].reset_index(drop=True)
+        n_events = len(first)
+        self.report.start(n_events)
+        events = gpd.GeoDataFrame({
+            "device_id": first["device_id"],
+            "first_state": first["vehicle_state"].astype(str),
+            "start_reason": first["event_types"].astype(str),
+            "start_time": first["event_time"],
+            "n_records": np.bincount(event_id[ready], minlength=n_events + 1)[1:],
+        }, geometry=first.geometry.values, crs=rec.crs)
+
+        # an event without a following record (end of data) has no end; use a dummy row
+        end_rec = rec.iloc[np.where(has_end, enders, 0)]
+        end_state = end_rec["vehicle_state"].astype(str).to_numpy()
+        events["end_time"] = end_rec["event_time"].to_numpy()
+        events["end_x"] = end_rec.geometry.x.to_numpy()
+        events["end_y"] = end_rec.geometry.y.to_numpy()
+        events["end_reason"] = np.where(np.isin(end_state, READY), "unknown",
+                                        pd.Series(end_state).map(END_REASON).fillna("unknown"))
+
+        events = self._drop(events, ~has_end, "no following record (censored at month end)")
+        events = self._drop(events, events["first_state"] != "available",
+                            "starts with an orphan reservation")
+        events = self._drop(events, events["end_time"] < pd.Timestamp(self.cfg.study.start),
+                            "ended before study period")
+        return events.reset_index(drop=True)
+
+    def drop_relocated(self, events: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """The vehicle should leave from where it was parked; a larger gap means the
+        recorded location is unreliable."""
+        gap = np.hypot(events["end_x"] - events.geometry.x, events["end_y"] - events.geometry.y)
+        return self._drop(events, gap > self.rules.same_location_m,
+                          f"start/end location > {self.rules.same_location_m:g} m apart")
+
+    def merge_interruptions(self, events: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """Merge an event with the next one of the same vehicle if the vehicle was 'away'
+        only briefly and came back to the same spot (a ride without movement, a short
+        operator status flip...)."""
+        e = events.sort_values(["device_id", "start_time"], ignore_index=True)
+        nxt = e.shift(-1)
+        gap_s = (nxt["start_time"] - e["end_time"]).dt.total_seconds()
+        dist = np.hypot(nxt.geometry.x - e.geometry.x, nxt.geometry.y - e.geometry.y)
+        same_device = nxt["device_id"].eq(e["device_id"]).fillna(False).astype(bool)
+        joins_next = (same_device & (gap_s <= self.rules.merge_gap_s)
+                      & (dist <= self.rules.same_location_m))
+        group = np.cumsum(~np.r_[False, joins_next.to_numpy()[:-1]])
+
+        g = e.groupby(group, sort=False)
+        merged = g.first()
+        for col in ("end_time", "end_x", "end_y", "end_reason"):
+            merged[col] = g[col].last()
+        merged["n_records"] = g["n_records"].sum()
+        self.report.add("merged with the next event (short interruption)",
+                        len(e) - len(merged))
+        return gpd.GeoDataFrame(merged.reset_index(drop=True), geometry="geometry", crs=e.crs)
+
+    # ------------------------------------------------------------------ stage 5
+    def add_spatial_attributes(self, events: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        layers = self.layers
+        events = self._drop(events, ~events.within(layers.city_boundary), "outside city")
+        try:
+            open_space = layers.open_space.buffer(self.rules.open_space_buffer_m)
+            events = self._drop(events, ~events.within(open_space),
+                                "not in public open space (GPS error)")
+        except FileNotFoundError:
+            pass
+
+        events = self._join_polygons(events, layers.areas, "area")
+        events = self._join_polygons(events, layers.taz, "TAZ")
+        with contextlib.suppress(FileNotFoundError):  # optional layer
+            events = self._join_polygons(events, layers.neighbourhoods, None)
+        nearest = gpd.sjoin_nearest(events[["geometry"]], layers.bike_lanes[["geometry"]],
+                                    how="left", distance_col="dist_to_infra_m")
+        events["dist_to_infra_m"] = nearest.groupby(level=0)["dist_to_infra_m"].first()
+
+        events["duration_s"] = (events["end_time"] - events["start_time"]).dt.total_seconds()
+        events["start_hour"] = events["start_time"].dt.hour
+        events["end_hour"] = events["end_time"].dt.hour
+        events["weekday"] = events["start_time"].dt.day_name()
+        return events
+
+    def associate_trips(self, events: gpd.GeoDataFrame,
+                        trip_starts: pd.DataFrame) -> gpd.GeoDataFrame:
+        """Link each event that ended in a ride to that ride in the Trips data: same vehicle,
+        trip starts within ``trip_match_time_s`` of the event's end, and nearby."""
+        rides = events[events["end_reason"] == "on_trip"]
+        left = rides[["device_id", "end_time", "end_x", "end_y"]].reset_index().sort_values(
+            "end_time")
+        left["end_time"] = left["end_time"].astype("datetime64[us]")
+        right = trip_starts.astype({"start_time": "datetime64[us]"}).sort_values("start_time")
+        m = pd.merge_asof(left, right, left_on="end_time", right_on="start_time",
+                          by="device_id", direction="nearest",
+                          tolerance=pd.Timedelta(seconds=self.rules.trip_match_time_s))
+        dist = np.hypot(m["end_x"] - m["trip_x"], m["end_y"] - m["trip_y"])
+        m = m[dist <= self.rules.trip_match_distance_m]
+        events["trip_id"] = pd.Series(m["trip_id"].to_numpy(), index=m["index"].to_numpy())
+        return events
+
+    # ------------------------------------------------------------------ appendix G
+    def drop_artifacts(self, events: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        r = self.rules
+        events = self._drop(events, (events["end_reason"] == "on_trip") & events["trip_id"].isna(),
+                            "ride end without a matching trip")
+        low_battery = (events["end_reason"].isin(["non_operational", "removed"])
+                       & (events["duration_s"] < r.low_battery_window_s))
+        events = self._drop(events, low_battery,
+                            f"taken out of service within {r.low_battery_window_s / 60:g} min "
+                            "(low battery after a ride)")
+        events = self._drop(events, events["duration_s"] < r.min_duration_s,
+                            f"shorter than {r.min_duration_s:g} s")
+        return events.reset_index(drop=True)
+
+    # ------------------------------------------------------------------ helpers
+    def _drop(self, df, mask, step: str):
+        mask = np.asarray(mask, dtype=bool)
+        self.report.add(step, int(mask.sum()))
+        return df.loc[~mask]
+
+    @staticmethod
+    def _join_polygons(points: gpd.GeoDataFrame, polygons: gpd.GeoDataFrame,
+                       column: str | None) -> gpd.GeoDataFrame:
+        cols = [column, "geometry"] if column else list(polygons.columns)
+        joined = gpd.sjoin(points, polygons[cols], how="left", predicate="within")
+        joined = joined[~joined.index.duplicated()]
+        return joined.drop(columns="index_right")
+
+
+def load_trip_starts(parts_dir, cfg: Config) -> pd.DataFrame:
+    """Trip id, vehicle and projected start location of every raw trip (no full routes)."""
+    table = ds.dataset(parts_dir).to_table(
+        columns=["trip_id", "device_id", "start_time", "lon", "lat", "n_points"])
+    table = table.filter(pc.greater(table["n_points"], 0))
+    lon = pc.list_element(table["lon"], 0).to_numpy()
+    lat = pc.list_element(table["lat"], 0).to_numpy()
+    x, y = lonlat_transformer(cfg).transform(lon, lat)
+    return pd.DataFrame({
+        "trip_id": table["trip_id"].to_pandas(),
+        "device_id": table["device_id"].to_pandas().astype("string"),
+        "start_time": table["start_time"].to_pandas(),
+        "trip_x": x, "trip_y": y,
+    })

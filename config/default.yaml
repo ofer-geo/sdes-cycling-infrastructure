@@ -1,0 +1,63 @@
+# All paths are relative to the repository root unless absolute.
+paths:
+  raw_trips: ../raw_data/Trips/2023-07.rar
+  raw_status_changes: ../raw_data/Status_changes/2023-07.rar
+  raw_status_changes_previous: ../raw_data/Status_changes/2023-06.rar   # seeds each vehicle's state on July 1st
+  interim: data/interim
+  processed: data/processed
+  layers: data/layers
+  figures: docs/figures
+
+# GIS layers (any OGR-readable path; .zip archives are read in place). null = not available.
+# The four used layers ship in data/layers (Tel Aviv-Yafo Municipality, see its README).
+layers:
+  city_boundary: data/layers/city_boundary.zip
+  taz: data/layers/taz.zip
+  areas: data/layers/areas.zip
+  bike_lanes: data/layers/bike_lanes.zip
+  slow_zones: null
+  neighbourhoods: null
+  open_space: null
+
+# Projected CRS used for every metric operation (Israel Transverse Mercator)
+crs:
+  geographic: EPSG:4326
+  projected: EPSG:2039
+
+study:
+  start: "2023-07-01"
+  end: "2023-08-01"
+  vehicle_type: scooter
+  osm_place: Tel Aviv Subdistrict, Israel
+
+trips:
+  city_buffer_m: 100          # trips must lie within the city boundary buffered by this much
+  max_ping_gap_m: 70         # 10 s ping interval x 25 km/h speed cap
+  min_length_m: 250
+  max_length_m: 15000
+  max_route_to_aerial_ratio: 2.0
+
+map_matching:
+  buffer_m: 25
+  min_edge_coverage: 0.9      # share of an OSM edge's length that must fall inside the buffer
+  short_trip_m: 1000
+  short_trip_max_abs_diff_m: 100
+  long_trip_max_rel_diff: 0.05
+
+infrastructure:
+  buffer_m: 25
+
+speed:
+  min_segment_m: 80           # shorter inside/outside segments flip to their neighbour's type
+  slow_zone_kmh: 15
+  speed_quantiles: [0.01, 0.99]
+
+parking:
+  same_location_m: 25
+  merge_gap_s: 300
+  low_battery_window_s: 600
+  min_duration_s: 5
+  trip_match_time_s: 1
+  trip_match_distance_m: 25
+  open_space_buffer_m: 2.5
+  distance_groups_m: [0, 25, 50, 75, 100]

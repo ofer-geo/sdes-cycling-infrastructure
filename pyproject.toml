@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdes"
+version = "1.0.0"
+description = "Cycling infrastructure and shared dockless e-scooter (SDES) behaviour in Tel Aviv-Yafo"
+authors = [{ name = "Ofer Shahal" }]
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "geopandas>=1.0",
+    "shapely>=2.0",
+    "pyproj>=3.6",
+    "pyogrio>=0.9",
+    "osmnx>=2.0",
+    "networkx>=3.2",
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pyarrow>=15",
+    "orjson>=3.9",
+    "matplotlib>=3.8",
+    "seaborn>=0.13",
+    "pyyaml>=6",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5", "jupyter"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "PD"]
+ignore = [
+    "PD011",  # .values on geometry columns returns a GeometryArray, as intended
+    "PD010",  # .unstack() after groupby is clearer than pivot_table here
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
